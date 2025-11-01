@@ -1,0 +1,323 @@
+# Auth
+SECRET_KEY=METTRE_VOTRE_SECRET
+
+# APIs IA
+STABILITY_KEY=METTRE_VOTRE_CLE_STABILITY
+PIKA_KEY=METTRE_VOTRE_CLE_PIKA
+
+# Stockage cloud
+AWS_KEY=METTRE_VOTRE_AWS_KEY
+AWS_SECRET=METTRE_VOTRE_SECRET_AWS
+BUCKET_NAME=NOM_BUCKET
+
+# Stripe
+STRIPE_KEY=METTRE_VOTRE_STRIPE_KEY
+STRIPE_WEBHOOK=METTRE_VOTRE_STRIPE_WEBHOOK
+
+# Base de données
+DATABASE_URL=postgres://USER:PASS@HOST:PORT/DBNAME
+
+fastapi
+uvicorn
+requests
+pillow
+boto3
+python-jose
+passlib[bcrypt]
+stripe
+python-multipart
+
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from auth import create_jwt, decode_jwt, hash_password, verify_password
+from tasks import add_task
+import os
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+UPLOAD_FOLDER = "./uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+@app.post("/signup")
+async def signup(email: str, password: str):
+    hashed = hash_password(password)
+    # ici : ajouter à la BDD
+    token = create_jwt(1)  # remplacer par id réel
+    return {"token": token}
+
+@app.post("/login")
+async def login(email: str, password: str):
+    # ici : récupérer utilisateur BDD
+    hashed = hash_password(password)
+    if not verify_password(password, hashed):
+        return {"error": "Mot de passe incorrect"}
+    token = create_jwt(1)
+    return {"token": token}
+
+@app.post("/upload")
+async def upload_photos(files: list[UploadFile] = File(...)):
+    saved = []
+    for f in files:
+        path = f"{UPLOAD_FOLDER}/{f.filename}"
+        with open(path, "wb") as file:
+            file.write(await f.read())
+        saved.append(path)
+    return {"uploaded": saved}
+
+@app.post("/generate_image")
+async def generate_image(prompt: str, background_tasks: BackgroundTasks, user_id: int = 1):
+    task_id = add_task("image", prompt, user_id)
+    return {"task_id": task_id}
+
+@app.post("/generate_video")
+async def generate_video(prompt: str, duration: int = 5, background_tasks: BackgroundTasks, user_id: int = 1):
+    task_id = add_task("video", prompt, user_id, duration)
+    return {"task_id": task_id}
+
+@app.get("/gallery")
+async def gallery(user_id: int = 1):
+    files = os.listdir(UPLOAD_FOLDER)
+    urls = [f"/uploads/{f}" for f in files]
+    return {"gallery": urls}
+
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+import os
+from fastapi import HTTPException
+
+SECRET_KEY = os.getenv("SECRET_KEY", "secret")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(password, hashed):
+    return pwd_context.verify(password, hashed)
+
+def create_jwt(user_id: int):
+    return jwt.encode({"sub": user_id}, SECRET_KEY, algorithm="HS256")
+
+def decode_jwt(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return payload.get("sub")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token invalide")
+
+import requests
+from PIL import Image, ImageDraw, ImageFont
+from storage import upload_file_to_s3
+import os
+
+STABILITY_KEY = os.getenv("STABILITY_KEY")
+PIKA_KEY = os.getenv("PIKA_KEY")
+UPLOAD_FOLDER = "./uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+def add_watermark(image_path, watermark_text="IA Générée"):
+    img = Image.open(image_path)
+    draw = ImageDraw.Draw(img)
+    font_size = max(20, img.width // 20)
+    font = ImageFont.load_default()
+    draw.text((10, img.height - font_size - 10), watermark_text, fill=(255,255,255), font=font)
+    img.save(image_path)
+
+def generate_image_async(prompt, task_id, user_id):
+    url = "https://api.stability.ai/v1/generate"
+    headers = {"Authorization": f"Bearer {STABILITY_KEY}"}
+    data = {"prompt": prompt}
+    response = requests.post(url, json=data, headers=headers)
+    image_url = response.json().get("image_url")
+    
+    image_path = f"{UPLOAD_FOLDER}/{task_id}.png"
+    img_data = requests.get(image_url).content
+    with open(image_path, "wb") as f:
+        f.write(img_data)
+    add_watermark(image_path)
+    return upload_file_to_s3(image_path, f"{user_id}/{task_id}.png")
+
+def generate_video_async(prompt, duration, task_id, user_id):
+    url = "https://api.pika.art/v1/video/generate"
+    headers = {"Authorization": f"Bearer {PIKA_KEY}"}
+    data = {"prompt": prompt, "duration": duration}
+    response = requests.post(url, json=data, headers=headers)
+    video_url = response.json().get("video_url")
+    
+    video_path = f"{UPLOAD_FOLDER}/{task_id}.mp4"
+    vid_data = requests.get(video_url).content
+    with open(video_path, "wb") as f:
+        f.write(vid_data)
+    return upload_file_to_s3(video_path, f"{user_id}/{task_id}.mp4")
+
+from api_integration import generate_image_async, generate_video_async
+
+tasks_queue = []
+
+def add_task(task_type, prompt, user_id, duration=5):
+    task_id = f"{task_type}_{len(tasks_queue)+1}"
+    tasks_queue.append(task_id)
+    if task_type == "image":
+        generate_image_async(prompt, task_id, user_id)
+    elif task_type == "video":
+        generate_video_async(prompt, duration, task_id, user_id)
+    return task_id
+
+import boto3
+import os
+
+AWS_KEY = os.getenv("AWS_KEY")
+AWS_SECRET = os.getenv("AWS_SECRET")
+BUCKET_NAME = os.getenv("BUCKET_NAME")
+
+s3 = boto3.client(
+    "s3",
+    aws_access_key_id=AWS_KEY,
+    aws_secret_access_key=AWS_SECRET
+)
+
+def upload_file_to_s3(file_path, s3_key):
+    s3.upload_file(file_path, BUCKET_NAME, s3_key)
+    url = f"https://{BUCKET_NAME}.s3.amazonaws.com/{s3_key}"
+    return url
+
+export default function Home() {
+  return (
+    <div>
+      <h1>Bienvenue sur ta plateforme Influenceur IA</h1>
+      <a href="/signup">Créer un compte</a> | <a href="/login">Se connecter</a>
+    </div>
+  )
+}
+
+import { useState } from 'react';
+
+export default function Signup() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  
+  const handleSignup = async () => {
+    const res = await fetch('http://localhost:8000/signup', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email, password})
+    });
+    const data = await res.json();
+    alert('Token JWT: ' + data.token);
+  }
+
+  return (
+    <div>
+      <h1>Signup</h1>
+      <input placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} />
+      <input placeholder="Password" type="password" value={password} onChange={e=>setPassword(e.target.value)} />
+      <button onClick={handleSignup}>S’inscrire</button>
+    </div>
+  )
+}
+
+import { useState } from 'react';
+
+export default function Login() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  
+  const handleLogin = async () => {
+    const res = await fetch('http://localhost:8000/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email, password})
+    });
+    const data = await res.json();
+    alert('Token JWT: ' + data.token);
+  }
+
+  return (
+    <div>
+      <h1>Login</h1>
+      <input placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} />
+      <input placeholder="Password" type="password" value={password} onChange={e=>setPassword(e.target.value)} />
+      <button onClick={handleLogin}>Se connecter</button>
+    </div>
+  )
+}
+
+import { useState } from 'react';
+
+const templates = [
+  { id: 1, name: "Plage", prompt: "influenceur·se sur une plage tropicale" },
+  { id: 2, name: "Festival", prompt: "influenceur·se en festival de musique en soirée" },
+  { id: 3, name: "Voyage", prompt: "influenceur·se dans les rues de Paris" }
+];
+
+export default function Templates() {
+  const [selected, setSelected] = useState(null);
+
+  const handleGenerate = async () => {
+    if(!selected) return alert("Sélectionnez un template");
+    const res = await fetch("http://localhost:8000/generate_image", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: selected.prompt })
+    });
+    const data = await res.json();
+    alert("Tâche en cours, ID : " + data.task_id);
+  }
+
+  return (
+    <div>
+      <h1>Choisissez un template</h1>
+      {templates.map(t=>(
+        <div key={t.id} onClick={()=>setSelected(t)} style={{border:selected?.id===t.id?'2px solid blue':'1px solid gray', padding:10, margin:5}}>
+          <h2>{t.name}</h2>
+          <p>{t.prompt}</p>
+        </div>
+      ))}
+      <button onClick={handleGenerate}>Générer</button>
+    </div>
+  )
+}
+
+import { useEffect, useState } from 'react';
+
+export default function Gallery() {
+  const [gallery, setGallery] = useState([]);
+
+  useEffect(()=>{
+    fetch("http://localhost:8000/gallery")
+      .then(res=>res.json())
+      .then(data=>setGallery(data.gallery));
+  },[]);
+
+  return (
+    <div>
+      <h1>Galerie</h1>
+      {gallery.map((file, idx)=>(
+        file.endsWith(".png") ? 
+        <img key={idx} src={`http://localhost:8000/uploads/${file}`} width={200} /> :
+        <video key={idx} src={`http://localhost:8000/uploads/${file}`} width={200} controls/>
+      ))}
+    </div>
+  )
+}
+
+{
+  "name": "frontend",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "13.5.0",
+    "react": "18.2.0",
+    "react-dom": "18.2.0"
+  }
+}
